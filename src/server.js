@@ -1,14 +1,18 @@
 import "dotenv/config";
 import { randomUUID } from "node:crypto";
+import { once } from "node:events";
 import { createServer } from "node:http";
 import express from "express";
-import { MongoClient } from "mongodb";
+import { GridFSBucket, MongoClient, ObjectId } from "mongodb";
+import multer from "multer";
 import { Server } from "socket.io";
 
 import {
+  authenticateHeaders,
   authenticatePair,
   otherUser,
   publicMessage,
+  validateMediaMessage,
   validateOutgoingMessage,
 } from "./protocol.js";
 
@@ -41,9 +45,157 @@ const io = new Server(httpServer, {
 const mongo = new MongoClient(mongoUri);
 
 await mongo.connect();
-const messages = mongo.db(databaseName).collection("messages");
+const database = mongo.db(databaseName);
+const messages = database.collection("messages");
+const media = new GridFSBucket(database, { bucketName: "private_media" });
+const mediaFiles = database.collection("private_media.files");
+const upload = multer({
+  storage: multer.memoryStorage(),
+  limits: { files: 1, fileSize: 40 * 1024 * 1024 },
+});
 await messages.createIndex({ sender: 1, receiver: 1, time: -1 });
 await messages.createIndex({ messageId: 1 }, { unique: true });
+
+function requireHttpUser(request, response, next) {
+  const user = authenticateHeaders(request.headers, secrets);
+  if (user === null) {
+    response.status(401).json({ ok: false, error: "Not authorized." });
+    return;
+  }
+  request.pixelUser = user;
+  next();
+}
+
+app.post(
+  "/media/messages",
+  requireHttpUser,
+  upload.single("file"),
+  async (request, response) => {
+    const sender = request.pixelUser;
+    const valid = validateMediaMessage(sender, request.body, request.file);
+    if (!valid.ok) {
+      response.status(400).json(valid);
+      return;
+    }
+    const file = request.file;
+    const uploadStream = media.openUploadStream(file.originalname, {
+      contentType: file.mimetype,
+      metadata: {
+        sender,
+        receiver: valid.receiver,
+        type: valid.type,
+      },
+    });
+    try {
+      const finished = once(uploadStream, "finish");
+      uploadStream.end(file.buffer);
+      await finished;
+      const mediaId = uploadStream.id.toString();
+      const labels = {
+        image: "Sent a photo",
+        video: "Sent a video",
+        audio: "Sent a voice message",
+      };
+      const message = {
+        messageId: randomUUID(),
+        sender,
+        receiver: valid.receiver,
+        text: labels[valid.type],
+        type: valid.type,
+        mediaId,
+        mediaMimeType: file.mimetype,
+        mediaName: file.originalname.slice(0, 180),
+        mediaSize: file.size,
+        mediaDurationMs: valid.durationMs,
+        time: new Date(),
+        read: false,
+      };
+      await messages.insertOne(message);
+      const outgoing = publicMessage(message);
+      io.to(`user:${sender}`)
+        .to(`user:${valid.receiver}`)
+        .emit("message:new", outgoing);
+      response.status(201).json({ ok: true, message: outgoing });
+    } catch {
+      if (uploadStream.id) {
+        await media.delete(uploadStream.id).catch(() => {});
+      }
+      response.status(500).json({ ok: false, error: "Media was not saved." });
+    }
+  },
+);
+
+app.get("/media/:id", requireHttpUser, async (request, response) => {
+  if (!ObjectId.isValid(request.params.id)) {
+    response.status(404).end();
+    return;
+  }
+  const id = new ObjectId(request.params.id);
+  const file = await mediaFiles.findOne({ _id: id });
+  if (!file) {
+    response.status(404).end();
+    return;
+  }
+  const user = request.pixelUser;
+  const metadata = file.metadata ?? {};
+  if (metadata.sender !== user && metadata.receiver !== user) {
+    response.status(403).end();
+    return;
+  }
+
+  const length = Number(file.length);
+  const contentType = file.contentType ?? "application/octet-stream";
+  response.setHeader("Accept-Ranges", "bytes");
+  response.setHeader("Content-Type", contentType);
+  response.setHeader(
+    "Content-Disposition",
+    `inline; filename="${String(file.filename).replaceAll('"', "")}"`,
+  );
+
+  const range = request.headers.range;
+  let start = 0;
+  let end = length - 1;
+  if (typeof range === "string") {
+    const match = /^bytes=(\d*)-(\d*)$/.exec(range);
+    if (!match) {
+      response.status(416).setHeader("Content-Range", `bytes */${length}`);
+      response.end();
+      return;
+    }
+    start = match[1] ? Number.parseInt(match[1], 10) : 0;
+    end = match[2] ? Number.parseInt(match[2], 10) : length - 1;
+    if (start < 0 || end < start || start >= length) {
+      response.status(416).setHeader("Content-Range", `bytes */${length}`);
+      response.end();
+      return;
+    }
+    end = Math.min(end, length - 1);
+    response.status(206);
+    response.setHeader("Content-Range", `bytes ${start}-${end}/${length}`);
+  }
+  response.setHeader("Content-Length", end - start + 1);
+  media
+    .openDownloadStream(id, { start, end: end + 1 })
+    .on("error", () => {
+      if (!response.headersSent) response.status(404);
+      response.end();
+    })
+    .pipe(response);
+});
+
+app.use((error, _request, response, next) => {
+  if (error instanceof multer.MulterError) {
+    response.status(400).json({
+      ok: false,
+      error:
+        error.code === "LIMIT_FILE_SIZE"
+          ? "This file is too large."
+          : "Could not accept this file.",
+    });
+    return;
+  }
+  next(error);
+});
 
 io.use((socket, next) => {
   const user = authenticatePair(socket.handshake.auth, secrets);
@@ -92,6 +244,7 @@ io.on("connection", (socket) => {
       sender: user,
       receiver: valid.receiver,
       text: valid.text,
+      type: "text",
       time: new Date(),
       read: false,
     };
