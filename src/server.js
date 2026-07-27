@@ -11,7 +11,9 @@ import {
   authenticateHeaders,
   authenticatePair,
   otherUser,
+  publicDrawing,
   publicMessage,
+  validateDrawingBoard,
   validateMediaMessage,
   validateOutgoingMessage,
 } from "./protocol.js";
@@ -40,13 +42,14 @@ app.get("/health", (_request, response) => {
 const httpServer = createServer(app);
 const io = new Server(httpServer, {
   serveClient: false,
-  maxHttpBufferSize: 16 * 1024,
+  maxHttpBufferSize: 512 * 1024,
 });
 const mongo = new MongoClient(mongoUri);
 
 await mongo.connect();
 const database = mongo.db(databaseName);
 const messages = database.collection("messages");
+const drawings = database.collection("drawings");
 const media = new GridFSBucket(database, { bucketName: "private_media" });
 const mediaFiles = database.collection("private_media.files");
 const upload = multer({
@@ -55,6 +58,7 @@ const upload = multer({
 });
 await messages.createIndex({ sender: 1, receiver: 1, time: -1 });
 await messages.createIndex({ messageId: 1 }, { unique: true });
+await drawings.createIndex({ boardId: 1 }, { unique: true });
 
 function requireHttpUser(request, response, next) {
   const user = authenticateHeaders(request.headers, secrets);
@@ -278,6 +282,51 @@ io.on("connection", (socket) => {
       acknowledge({ ok: result.matchedCount === 1 });
     } catch {
       acknowledge({ ok: false, error: "Read status was not saved." });
+    }
+  });
+
+  socket.on("drawing:load", async (_payload, acknowledge = () => {}) => {
+    try {
+      const board = await drawings.findOne({
+        boardId: "snjv-debu-shared-board",
+      });
+      acknowledge({ ok: true, board: publicDrawing(board) });
+    } catch {
+      acknowledge({ ok: false, error: "Could not load the shared drawing." });
+    }
+  });
+
+  socket.on("drawing:replace", async (payload, acknowledge = () => {}) => {
+    const valid = validateDrawingBoard(user, payload);
+    if (!valid.ok) {
+      acknowledge(valid);
+      return;
+    }
+    try {
+      await drawings.updateOne(
+        { boardId: "snjv-debu-shared-board" },
+        {
+          $set: {
+            backgroundColor: valid.board.backgroundColor,
+            strokes: valid.board.strokes,
+            updatedBy: user,
+            updatedAt: new Date(),
+          },
+          $inc: { revision: 1 },
+          $setOnInsert: { boardId: "snjv-debu-shared-board" },
+        },
+        { upsert: true },
+      );
+      const saved = await drawings.findOne({
+        boardId: "snjv-debu-shared-board",
+      });
+      const outgoing = publicDrawing(saved);
+      io.to(`user:${user}`)
+        .to(`user:${valid.receiver}`)
+        .emit("drawing:updated", outgoing);
+      acknowledge({ ok: true, board: outgoing });
+    } catch {
+      acknowledge({ ok: false, error: "The drawing was not saved." });
     }
   });
 });
